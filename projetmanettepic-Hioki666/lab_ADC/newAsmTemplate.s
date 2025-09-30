@@ -17,7 +17,7 @@
 #include <xc.inc>
 
 ; --- Constantes (Fosc=8MHz, TMR0 -> 10ms par overflow) ---
-TMR0_AUTOLOAD    equ 178       ; 256 - 178 => ~10 ms (déjà dans ton code)
+TMR0_AUTOLOAD    equ 178       ; 256 - 178 ? 10 ms
 
 ; --- Vecteurs -------------------------------------------------------
 PSECT resetVec,class=CODE,delta=2,abs
@@ -63,35 +63,18 @@ start:
     call    init_pic
 
 
- ; --- loop (remplacé pour gérer ADC + PWM logiciel) ---------------
+ ; --- loop -------------------------------------------   
 loop:
-    ; Lire ADC (RA0 / AN0) -> ADRESH (8 MSBs lorsque left-justified)
-    call ADC_Read8         ; résultat en ADRESH et sauvegardé en d1
-
-    ; --- convertir ADRESH (0..255) en duty (0..31) : duty = ADRESH >> 3 ---
-    banksel ADRESH
-    movf    ADRESH,W
-    movwf   d1             ; d1 = valeur ADC (8 bits)
-    rrcf    d1,F
-    rrcf    d1,F
-    rrcf    d1,F           ; d1 = ADRESH >> 3  (0..31)
-    movf    d1,W
-    movwf   vit            ; vit := duty (0..31)
-
-    ; Gérer le comportement boutons / autres routines (inchangé)
     call Test_Boutons
     btfsc Flag_Bouton_1,0
     call Change_Led
     btfsc Flag_Bouton_2,0
     call Vitesse_Led
     call Etat_Constant
-
-    ; PWM: Toggle_LED gère maintenant le PWM logiciel (synchronisé sur flag_10_ms)
-    call Toggle_LED
-
+    call Toggle_LED   ;si le temps est venu
     goto loop  
-
- ; --- Fonctions inchangées / adaptées -----------------------------
+  
+ ; --- Fonctions -------------------------------------------   
 Test_Boutons:
     call Bouton_1
     call Bouton_2
@@ -153,59 +136,36 @@ vitesse4:
     movlw 50
     movwf vit
     return
-
-; --- Toggle_LED (remplacé) : réalise PWM logiciel à base de tick 10ms ---
-; vit contient la consigne de duty (0..PWM_PERIOD-1)
-; tick_div contient la PWM_PERIOD (ici 32)
-Toggle_LED:
+    
+ Toggle_LED:
     btfss flag_10_ms,0
     return
     bcf flag_10_ms,0
+    ; --- Ex: diviseur logiciel pour ~500 ms ---
+    banksel tick_div
+    decfsz  tick_div,f        ; 50 * 10ms = 500ms
+    return
+    movf   vit,w
+    movwf   tick_div
 
-    ; incrémenter pwm_counter (d2) modulo tick_div (period)
-    banksel d2
-    incf    d2,f
-    ; si d2 == tick_div -> rwrap à 0
-    movf    tick_div,w
-    subwf   d2,w
-    btfss   STATUS,2        ; Z bit = 1 si d2 == tick_div
-    goto PWM_CHECK
-    ; si égal => remettre à 0
-    clrf    d2
-
-PWM_CHECK:
-    ; comparer d2 (counter) et vit (duty)
-    movf    d2,w
-    subwf   vit,w
-    ; si d2 < vit => résultat de subwf met Z=0 and C=1 ? We will check carry:
-    ; subwf d2,w sets W = d2 - vit ; but easier: we want to test if d2 < vit
-    ; We'll implement by: movf vit,w ; subwf d2,w ; btfsc STATUS,0 ??? simpler approach below.
-
-    ; Implement test: if d2 < vit -> turn LED on, else off
-    movf    d2,w
-    movwf   d3         ; d3 = d2
-    movf    vit,w
-    subwf   d3,w       ; W = d3 - vit -> if d3 < vit => result borrow -> STATUS,C = 0
-    btfsc   STATUS,0   ; check Carry (C=1 means no borrow => d3 >= vit)
-    goto LED_OFF
-    ; else (borrow) => d3 < vit => LED ON
-LED_ON:
+    ; --- Toggle RB3, forcer RB4 � 0 (exemple propre sans RMW pi�geux) ---
     banksel PORTB
-    ; Set RB3 = 1, force RB4 = 0 (keeps original behaviour of alternating bits)
     movf    PORTB,W
+    btfss LED,0
+    goto Diode1
+    goto Diode2
+Diode1:
     andlw   11101111B       ; RB4=0
-    iorlw   00001000B       ; set RB3=1
+    xorlw   00001000B       ; toggle RB3
     movwf   PORTB
     return
-LED_OFF:
-    banksel PORTB
-    ; Clear RB3 (and optionally set RB4=0)
-    movf    PORTB,W
+Diode2:
     andlw   11110111B       ; RB3=0
+    xorlw   00010000B       ; toggle RB4
     movwf   PORTB
     return
-
- ; --- Bouton 1 ---
+    
+                     ; --- Bouton 1 ---
 Bouton_1:
     banksel (PORTB)
     btfsc PORTB,6
@@ -223,7 +183,7 @@ presse1:
     movwf Flag_Bouton_1
     return
     
- ; --- Bouton 2 ---
+                         ; --- Bouton 2 ---
 Bouton_2:
     banksel (PORTB)
     btfsc PORTB,7
@@ -241,7 +201,7 @@ presse2:
     movwf Flag_Bouton_2
     return
     
- ; --- Bouton 3 ---
+                           ; --- Bouton 3 ---
 Bouton_3:
     banksel (PORTA)
     btfsc PORTA,7
@@ -258,55 +218,17 @@ presse3:
     movlw 00000001B
     xorwf Flag_Bouton_3          ; toggle flag 3
     return
-
-; --- ADC_Read8 (lecture 8-bit left-justifié sur ADRESH) ---
-; Résultat 0..255 en ADRESH ; on laisse ADRESH intact
-ADC_Read8:
-    ; Assumes ADC module already configured & channel selected = AN0
-    banksel ADCON0
-    bsf     ADCON0,2      ; GO/DONE = 1 -> start conversion
-WAIT_ADC:
-    btfsc   ADCON0,2
-    goto    WAIT_ADC
-    ; conversion finie -> ADRESH contient les 8 MSBs (left-justified)
-    return
-
+   
 ; --- Init -----------------------------------------------------------
 init_pic:
-    ; Oscillateur interne 8 MHz (si déjà configuré par config bits, OK)
+    ; Oscillateur interne 8 MHz (si d�j� configur� par config bits, OK)
     banksel OSCCON
     movlw   01111000B       ; IRCF=111 (8MHz)
     movwf   OSCCON
 
-    ; Tout en digital par défaut (on écrase plus bas pour AN0)
+    ; Tout en digital
     banksel ANSEL
     clrf    ANSEL
-
-    ; --- configuration ADC: AN0 (RA0) comme analogique, left-justified (ADRESH=8 MSBs) ---
-    banksel ANSEL
-    movlw   00000001B       ; AN0 analogique (ANSEL bit0 = 1), autres en digital
-    movwf   ANSEL
-
-    ; RA0 input
-    banksel TRISA
-    bsf     TRISA,0
-
-    ; Configurer ADCON1: left justified, Vref = VDD/VSS (VCFGx=0), ADCS2=0
-    banksel ADCON1
-    movlw   00000000B       ; ADFM=0 (left justify), ADCS2=0, VCFG1=0, VCFG0=0
-    movwf   ADCON1
-
-    ; Configurer ADCON0: channel 0 (AN0), ADON=1, ADCS bits (choose Fosc/8 or similar)
-    banksel ADCON0
-    movlw   01000001B       ; CHS=000 (AN0), GO/DONE=0, ADON=1, ADCS bits set to '01' (ex.)
-    movwf   ADCON0
-
-    ; petit délai d'acquisition (quelques µs). Utiliser une boucle simple.
-    movlw   0xFF
-    movwf   d3
-ACQ_DELAY:
-    decfsz  d3,f
-    goto    ACQ_DELAY
 
     ; LEDs RB3/RB4 en sortie
     banksel TRISB
@@ -318,14 +240,14 @@ ACQ_DELAY:
     bcf     PORTB,3
     bcf     PORTB,4
 
-    ; Timer0: horloge interne, préscaler 1:256 attribué à TMR0
+    ; Timer0: horloge interne, pr�scaler 1:256 attribu� � TMR0
     ; OPTION_REG bits: RBPU INTEDG T0CS T0SE PSA PS2 PS1 PS0
     ;                   1      x     0    0    0   1   1   1  => 0x87
     banksel OPTION_REG
     movlw   10000111B       ; pullups off, TMR0 intclk, presc 1:256
     movwf   OPTION_REG
 
-    ; Précharge pour ~10ms
+    ; Pr�charge pour ~10ms
     banksel TMR0
     movlw   TMR0_AUTOLOAD
     movwf   TMR0
@@ -336,27 +258,22 @@ ACQ_DELAY:
     bsf     INTCON,5          ; TMR0IE=1 (enable)
     bsf     INTCON,7          ; GIE=1
 
-    ; Init du diviseur logiciel (PWM period = 32 steps)
+    ; Init du diviseur logiciel (50 * 10ms = 500ms)
     banksel tick_div
-    movlw   32
+    movlw   50
     movwf   tick_div
-
-    ; init pwm_counter
-    banksel d2
-    clrf    d2
-
     return
 
-; --- RAM partagée pour l'ISR (évite les soucis de bank) ------------
+; --- RAM partag�e pour l?ISR (�vite les soucis de bank) ------------
 PSECT udata_shr
 W_TEMP:         ds 1
 STATUS_TEMP:    ds 1
 PCLATH_TEMP:    ds 1
-tick_div:       ds 1    ; pwm period (32)
-d1: ds 1               ; temp
-d2: ds 1               ; pwm_counter
-d3: ds 1               ; temp / delay
-vit: ds 1              ; duty (0..31)
+tick_div:       ds 1
+d1: ds 1
+d2: ds 1
+d3: ds 1
+vit: ds 1
 LED: ds 1
 etat: ds 1
 old2:  ds 1
@@ -365,6 +282,6 @@ old3: ds 1
 Flag_Bouton_1:  ds 1
 Flag_Bouton_2:  ds 1
 Flag_Bouton_3:  ds 1
-PSECT udata           ; RAM normale (banques)
+PSECT udata       ; RAM normale (banques)
 flag_10_ms: ds 1
     end
